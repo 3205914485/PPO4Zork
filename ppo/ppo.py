@@ -363,7 +363,7 @@ if __name__ == "__main__":
     parser.add_argument("--am_path", type=str, default="qwen-2.5-3B-instruct")
     parser.add_argument("--am_lora_path", type=str, default="sft/sft_model/qwen-2.5-3B-instruct_zork")
     parser.add_argument("--rm_lora", type=int, default=0)
-    parser.add_argument("--rm_path", type=str, default="/data3/whr/zhk/huggingface/qwen-2.5-1.5B-instruct")
+    parser.add_argument("--rm_path", type=str, default="qwen-2.5-1.5B-instruct")
     parser.add_argument("--rm_ckpts", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lr1e-5/checkpoint-epoch29.pt")
     parser.add_argument("--rm_lora_path", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lora_rk10/lora_epoch50")
     parser.add_argument("--device", type=str, default='cuda:1')
