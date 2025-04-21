@@ -1,0 +1,9 @@
+scripts
+logs
+evluate/outputs
+ppo/saving
+ppo/plot.ipynb
+sft/data/raw
+sft/data/processed
+sft/outputs
+sft/sft_model
