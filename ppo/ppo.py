@@ -138,7 +138,7 @@ def generate_action(tokenizer, actor, prompt, max_length=1024):
         inputs = tokenizer(prompt, return_tensors="pt",).to(actor.device)
         input_len = inputs.input_ids.shape[-1]
 
-        if input_len > max_length - 16:  # 留出 max_new_tokens 空间
+        if input_len > max_length - 16:  # max_new_tokens space
             inputs.input_ids = inputs.input_ids[:, -(max_length - 16):]
             inputs.attention_mask = inputs.attention_mask[:, -(max_length - 16):]
             input_len = inputs.input_ids.shape[-1]
@@ -251,7 +251,7 @@ def ppo_loop(args):
             end = step_info['observation']
             step += 1
             step_bar.update(1)
-            step_bar.set_postfix({"reward": reward, "location": location, "action": action[:30]})  # 可选：显示 reward 和截断的 action
+            step_bar.set_postfix({"reward": reward, "location": location, "action": action[:30]})
 
         step_bar.close()
         score = env.score
@@ -361,9 +361,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Model Config
     parser.add_argument("--am_path", type=str, default="qwen-2.5-3B-instruct")
-    parser.add_argument("--am_lora_path", type=str, default="sft/sft_model/qwen-2.5-3B-instruct_zork") # Using z2 for sft
+    parser.add_argument("--am_lora_path", type=str, default="sft/sft_model/qwen-2.5-3B-instruct_zork")
     parser.add_argument("--rm_lora", type=int, default=0)
-    parser.add_argument("--rm_path", type=str, default="qwen-2.5-1.5B-instruct")
+    parser.add_argument("--rm_path", type=str, default="/data3/whr/zhk/huggingface/qwen-2.5-1.5B-instruct")
     parser.add_argument("--rm_ckpts", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lr1e-5/checkpoint-epoch29.pt")
     parser.add_argument("--rm_lora_path", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lora_rk10/lora_epoch50")
     parser.add_argument("--device", type=str, default='cuda:1')
@@ -397,7 +397,6 @@ if __name__ == "__main__":
     args.log_save_path = os.path.join(args.prefix_path, "logs")
     args.trj_save_path = os.path.join(args.prefix_path, "trajectories")
 
-    # 创建文件夹
     os.makedirs(args.save_path, exist_ok=True)
     os.makedirs(args.log_save_path, exist_ok=True)
     os.makedirs(args.trj_save_path, exist_ok=True)
