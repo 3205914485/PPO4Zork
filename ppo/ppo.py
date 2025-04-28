@@ -27,8 +27,8 @@ SYSTEM_ACTOR_PROMPT = (
 
 SYSTEM_CRITIC_PROMPT = (
     "You are a value estimation model in a text-based interactive fiction game.\n"
-    "Your task is to evaluate the quality of a decision-making context, based on the current observation and past actions.\n"
-    "You will be given a history of previous observations and actions, along with the current state.\n"
+    "Your task is to evaluate the quality of a decision-making context, based on the current locations and past actions.\n"
+    "You will be given a history of previous locations and actions, along with the current state.\n"
     "Your job is to assess how promising this context is in terms of achieving high rewards in the game.\n\n"
 )
 
@@ -72,13 +72,19 @@ def save_trajectory(episode_idx, transistions, save_dir="ppo_ckpts"):
     prompts = transistions['prompts']
     actions = transistions['actions']
     rewards = transistions['rewards']
+    values = transistions['values']
+    advantages = transistions['advantages']
+    returns = transistions['returns']
     trajectory = []
     for i in range(len(prompts)):
         item = {
             "step": i,
             "prompts": prompts[i]['actor_prompt'],
             "action": actions[i],
-            "reward": rewards[i]
+            "reward": rewards[i],
+            "values": float(values[i]),
+            "advantages": float(advantages[i]),
+            "returns": float(returns[i])
         }   
         trajectory.append(item)
     
@@ -108,13 +114,16 @@ def build_actor_prompt(history, current):
 def build_critic_prompt(history, current):
     prompt = SYSTEM_CRITIC_PROMPT
     if history:
-        prompt += "--- History ---\n"
+        prompt += "--- Previous Actions & Observations ---\n"
         for line in history:
-            prompt += f"{line['observation'].strip()} \n>{line['action'].strip()}\n"
+            prompt += f"location:{line['location'].strip()} \n inventory:{line['inventory']} \n>action:{line['action'].strip()}\n\n"
         prompt += "\n"
-    prompt += "--- Current State ---\n"
-    prompt += f"Observation: {current['observation'].strip()}\n"
+
+    prompt += "--- Current Observation ---\n"
+    prompt += f"Location: {current['location']}\n"
     prompt += f"Inventory: {current['inventory']}\n"
+    prompt += f"Action: {current['action']}\n\n"
+    prompt += "Score this action from 0 to 1:\nAnswer:"
     return prompt
 
 def build_reward_prompt(history, current):
@@ -150,9 +159,9 @@ def generate_action(tokenizer, actor, prompt, max_length=1024):
                 max_new_tokens=16,
                 pad_token_id = tokenizer.eos_token_id,
                 do_sample = True,
-                top_k = 20,
-                top_p = 0.7,
-                temperature=1.1
+                top_k = 10,
+                top_p = 0.9,
+                temperature=0.8
             )
         generated = outputs[0][input_len:]
         action = tokenizer.decode(generated, skip_special_tokens=True).strip()
@@ -262,7 +271,7 @@ def ppo_loop(args):
         if score > max(scores_list):
             ppo_epochs *= 3
         scores_list.append(score)
-        save_trajectory(episode + 1, transitions, save_dir=args.trj_save_path)
+
         # GAE advantage & returns
         rewards = torch.tensor(transitions["rewards"], dtype=torch.float)
         values = torch.tensor(transitions["values"], dtype=torch.float)
@@ -270,6 +279,8 @@ def ppo_loop(args):
         # Normalize rewards
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         # rewards = torch.clamp(rewards, -1, 1)   
+
+        values = (values - values.mean()) / (values.std() + 1e-8)
 
         # GAE
         td_target = rewards + args.gamma * torch.cat([values[1:], torch.tensor([0.0])])
@@ -282,7 +293,12 @@ def ppo_loop(args):
 
         # critic target
         returns = advantages + values
+        
+        transitions['values'] = list(values.numpy())
+        transitions['advantages'] = list(advantages.numpy())
+        transitions['returns'] = list(returns.numpy())
 
+        save_trajectory(episode + 1, transitions, save_dir=args.trj_save_path)
         # PPO train
         actor_losses = []
         critic_losses = []
@@ -330,8 +346,8 @@ def ppo_loop(args):
                 ratio = torch.exp(log_prob - old_log_prob)
                 surr1 = ratio * advantage
                 surr2 = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * advantage
+               
                 actor_loss = -torch.min(surr1, surr2).mean()
-
                 if torch.isnan(actor_loss) or torch.isinf(actor_loss):
                     print("Found NaN in actor loss, skipping step")
                     continue

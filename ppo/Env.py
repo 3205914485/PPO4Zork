@@ -72,7 +72,7 @@ class ZorkEnv:
             if new_item:
                 shaped_reward += 2  # new item
             if shaped_reward == 0:
-                shaped_reward = -1  # penalty
+                shaped_reward = 0 # penalty
 
         # ===== exploration bonus / penalty =====
         if action not in self.unique_actions:

@@ -5,16 +5,29 @@ from peft import PeftModel, PeftConfig, LoraConfig, TaskType, get_peft_model
 import os
 
 class ActorModel(nn.Module):
-    def __init__(self, base_model_name_or_path, lora_path, device):
+    def __init__(self, base_model_name_or_path, lora_path, device, finetuing=True):
         super().__init__()
 
         base_model = AutoModelForCausalLM.from_pretrained(base_model_name_or_path, trust_remote_code=True, torch_dtype=torch.float32, device_map=device)
-        self.model = PeftModel.from_pretrained(base_model, lora_path, torch_dtype=torch.float32, device_map=device)
-        for name, param in self.model.named_parameters(): ##  
-            if 'lora' in name or 'Lora' in name:
-                param.requires_grad = True
+        if lora_path:
+            self.model = PeftModel.from_pretrained(base_model, lora_path, torch_dtype=torch.float32, device_map=device)
+            for name, param in self.model.named_parameters(): ##  
+                if 'lora' in name or 'Lora' in name:
+                    param.requires_grad = True
+        else:
+            if finetuing:
+                peft_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    inference_mode=False,
+                    r=10,
+                    lora_alpha=32,
+                    lora_dropout=0.1
+                )
+                self.model = get_peft_model(base_model, peft_config)
+            else:
+                self.model = base_model
         print(self.model.print_trainable_parameters())
-        # self.model.to(device)
+
         self.device = device
 
     def forward(self, input_ids, attention_mask, **kwargs):
@@ -126,7 +139,7 @@ def load_models(args):
         )
         CM.model = get_peft_model(CM.model, peft_config)
         CM.to(args.cm_device)
-        print(CM.model.print_trainable_parameters())
+        # print(CM.model.print_trainable_parameters())
     else:
         CM = CriticModel(AM, device=args.cm_device)
 
