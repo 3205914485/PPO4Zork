@@ -112,18 +112,19 @@ def build_actor_prompt(history, current):
     return prompt
 
 def build_critic_prompt(history, current):
-    prompt = SYSTEM_CRITIC_PROMPT
-    if history:
-        prompt += "--- Previous Actions & Observations ---\n"
-        for line in history:
-            prompt += f"location:{line['location'].strip()} \n inventory:{line['inventory']} \n>action:{line['action'].strip()}\n\n"
-        prompt += "\n"
+    # prompt = SYSTEM_CRITIC_PROMPT
+    prompt = ''
+    # if history:
+    #     prompt += "--- Previous Actions & Observations ---\n"
+    #     for line in history:
+    #         prompt += f"location:{line['location'].strip()} \n inventory:{line['inventory']} \n>action:{line['action'].strip()}\n\n"
+    #     prompt += "\n"
 
     prompt += "--- Current Observation ---\n"
     prompt += f"Location: {current['location']}\n"
     prompt += f"Inventory: {current['inventory']}\n"
     prompt += f"Action: {current['action']}\n\n"
-    prompt += "Score this action from 0 to 1:\nAnswer:"
+    # prompt += "Score this action from 0 to 1:\nAnswer:"
     return prompt
 
 def build_reward_prompt(history, current):
@@ -225,7 +226,7 @@ def ppo_loop(args):
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
     critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     scores_list = [0]
-    env = ZorkEnv("zork1.z5", max_repeat=30)
+    env = ZorkEnv("zork1.z5", max_repeat=20)
     # Sample trajetories
     for episode in range(args.max_episodes):
         print("Sampling trajectory")
@@ -296,7 +297,8 @@ def ppo_loop(args):
         advantages = compute_advantage(args.gamma, args.lmbda, td_delta)
 
         # Normalize advantage
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = (advantages - advantages.mean())
         # advantages = torch.clamp(advantages, -1, 1)
         # critic target
         returns = advantages + values
@@ -313,14 +315,17 @@ def ppo_loop(args):
         critic.train()
         print_trainable_parameters(actor, "Actor")
         print_trainable_parameters(critic, "Critic")
+        if args.pretrain_critic and episode <= args.pretrain_critic_episodes:
+            print('Still Pretraining the critic')
 
         for _ in tqdm(range(ppo_epochs)):
+            j = 0
             for i in tqdm(range(len(transitions["thinking"]))):
                 thinking_flag = transitions["thinking"][i]
                 generate = transitions['generates'][i]
-                # --- critic ---
+                
                 if thinking_flag:
-                    j = 0
+                    # --- critic ---
                     prompt = transitions["prompts"][j]
                     action = transitions["actions"][j]
                     old_log_prob = transitions["logprobs"][j]
@@ -338,61 +343,66 @@ def ppo_loop(args):
                     torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
                     critic_optimizer.step()
                     critic_losses.append(critic_loss.item())
-
+                    
                     # ---  actor ---
-                    inputs = tokenizer(prompt['actor_prompt'] + generate, return_tensors="pt", padding=True)
-                    input_ids = inputs.input_ids
-                    attention_mask = inputs.attention_mask
+                    if not args.pretrain_critic or episode > args.pretrain_critic_episodes:
 
-                    # new policy log_prob
-                    output = actor(input_ids=input_ids, attention_mask=attention_mask)
-                    logits = output.logits[:, :-1, :].cpu()  # remove last token (predict next) [bs, seqlen, vocab]
-                    probs = torch.log_softmax(logits, dim=-1) 
+                        inputs = tokenizer(prompt['actor_prompt'] + generate, return_tensors="pt", padding=True).to(actor.model.device)
+                        input_ids = inputs.input_ids
+                        attention_mask = inputs.attention_mask
 
-                    generate_ids = tokenizer(generate, return_tensors="pt").input_ids[:, 1:]
-                    selected_logprobs = probs[:, -generate_ids.size(1):].gather(-1, generate_ids.unsqueeze(-1)).squeeze(-1)
-                    log_prob = selected_logprobs.sum(dim=-1)
+                        # new policy log_prob
+                        output = actor(input_ids=input_ids, attention_mask=attention_mask)
+                        logits = output.logits[:, :-1, :].cpu()  # remove last token (predict next) [bs, seqlen, vocab]
+                        probs = torch.log_softmax(logits, dim=-1) 
 
-                    # PPO clipped loss
-                    ratio = torch.exp(log_prob - old_log_prob)
-                    surr1 = ratio * advantage
-                    surr2 = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * advantage
-                
-                    actor_loss = -torch.min(surr1, surr2).mean()
-                    if torch.isnan(actor_loss) or torch.isinf(actor_loss):
-                        print("Found NaN in actor loss, skipping step")
-                        continue
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
-                    actor_optimizer.step()
-                    actor_losses.append(actor_loss.item())
+                        generate_ids = tokenizer(generate, return_tensors="pt").input_ids[:, 1:]
+                        selected_logprobs = probs[:, -generate_ids.size(1):].gather(-1, generate_ids.unsqueeze(-1)).squeeze(-1)
+                        log_prob = selected_logprobs.sum(dim=-1)
+
+                        # PPO clipped loss
+                        ratio = torch.exp(log_prob - old_log_prob)
+                        surr1 = ratio * advantage
+                        surr2 = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * advantage
+                    
+                        actor_loss = -torch.min(surr1, surr2).mean()
+                        if torch.isnan(actor_loss) or torch.isinf(actor_loss):
+                            print("Found NaN in actor loss, skipping step")
+                            continue
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
+                        actor_optimizer.step()
+                        actor_losses.append(actor_loss.item())
+
                     j += 1
+
                 else:
-                    # ---  actor ---
-                    inputs = tokenizer(prompt['actor_prompt'] + generate, return_tensors="pt")
-                    input_ids = inputs.input_ids
-                    attention_mask = inputs.attention_mask
+                    if not args.pretrain_critic or episode > args.pretrain_critic_episodes:
+                        # ---  actor ---
+                        inputs = tokenizer(prompt['actor_prompt'] + generate, return_tensors="pt")
+                        input_ids = inputs.input_ids
+                        attention_mask = inputs.attention_mask
 
-                    # forward
-                    output = actor(input_ids=input_ids, attention_mask=attention_mask)
-                    logits = output.logits[:, :-1, :].cpu()
-                    probs = torch.log_softmax(logits, dim=-1)
+                        # forward
+                        output = actor(input_ids=input_ids, attention_mask=attention_mask)
+                        logits = output.logits[:, :-1, :].cpu()
+                        probs = torch.log_softmax(logits, dim=-1)
 
-                    generate_ids = tokenizer(generate, return_tensors="pt").input_ids[:, 1:]
+                        generate_ids = tokenizer(generate, return_tensors="pt").input_ids[:, 1:]
 
-                    selected_logprobs = probs[:, -generate_ids.size(1):].gather(-1, generate_ids.unsqueeze(-1)).squeeze(-1)
-                    log_prob = selected_logprobs.sum(dim=-1)
+                        selected_logprobs = probs[:, -generate_ids.size(1):].gather(-1, generate_ids.unsqueeze(-1)).squeeze(-1)
+                        log_prob = selected_logprobs.sum(dim=-1)
 
-                    actor_loss = log_prob.mean()  
-                    if torch.isnan(actor_loss) or torch.isinf(actor_loss):
-                        print("Found NaN in actor loss, skipping step")
-                        continue
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
-                    actor_optimizer.step()
-                    actor_losses.append(actor_loss.item())
+                        actor_loss = log_prob.mean()  
+                        if torch.isnan(actor_loss) or torch.isinf(actor_loss):
+                            print("Found NaN in actor loss, skipping step")
+                            continue
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
+                        actor_optimizer.step()
+                        actor_losses.append(actor_loss.item())
 
         # === Episode logging ===
         total_reward = sum(transitions["rewards"])
@@ -413,21 +423,22 @@ def ppo_loop(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Model Config
-    parser.add_argument("--am_path", type=str, default="qwen-2.5-7B-instruct")
+    parser.add_argument("--am_path", type=str, default="/data3/whr/zst/huggingface/qwen-2.5-7B-instruct")
     parser.add_argument("--am_lora_path", type=str, default=None)
     parser.add_argument("--rm_lora", type=int, default=0)
-    parser.add_argument("--rm_path", type=str, default="qwen-2.5-1.5B-instruct")
+    parser.add_argument("--rm_path", type=str, default="/data3/whr/zst/huggingface/qwen-2.5-1.5B-instruct")
     parser.add_argument("--rm_ckpts", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lr1e-5/checkpoint-epoch29.pt")
     parser.add_argument("--rm_lora_path", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lora_rk10/lora_epoch50")
     parser.add_argument("--device", type=str, default='cuda:0')
-    parser.add_argument("--cm_use_rm", type=int, default=0)
+    parser.add_argument("--cm_use_rm", type=int, default=1)
+    parser.add_argument("--cm_use_table", type=int, default=0)
     parser.add_argument("--am_device", type=str, default='auto')
     parser.add_argument("--cm_device", type=str, default='cuda:0')
     parser.add_argument("--rm_device", type=str, default='cuda:0')
 
     # Training Config
     parser.add_argument("--max_episodes", type=int, default=1000)
-    parser.add_argument("--max_epochs", type=int, default=2, help='for a trajectory')
+    parser.add_argument("--max_epochs", type=int, default=500, help='for a trajectory')
     parser.add_argument("--ppo_epochs", type=int, default=2)
     parser.add_argument("--max_history", type=int, default=3)
     parser.add_argument("--critic_lr", type=float, default=5e-6)
@@ -438,6 +449,8 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lmbda", type=float, default=0.95)
     parser.add_argument("--clip_eps", type=float, default=0.1)
+    parser.add_argument("--pretrain_critic", type=int, default=0)
+    parser.add_argument("--pretrain_critic_episodes", type=int, default=5)
     # Saving Config
     parser.add_argument("--prefix", type=str, default="test", help="prefix name for this run (creates ppo/{prefix}/...)")
     parser.add_argument("--save_every", type=int, default=10)

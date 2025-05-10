@@ -53,6 +53,38 @@ class CriticModel(nn.Module):
         score = self.value_head(last_hidden).squeeze(-1)
         return score 
 
+class TableValueCritic(nn.Module):
+    def __init__(self, device="cpu"):
+        super().__init__()
+        self.device = device
+        self.value_table = dict()
+
+    def get_key(self, location, inventory, action):
+        # 把三元组转成一个hashable的tuple作为key
+        return (location, tuple(sorted(inventory)), action)
+
+    def forward(self, location, inventory, action):
+        key = self.get_key(location, inventory, action)
+        if key not in self.value_table:
+            # Lazy init
+            self.value_table[key] = torch.zeros(1, device=self.device, requires_grad=True)
+        return self.value_table[key]
+
+    def update(self, location, inventory, action, target_value, lr=1e-2):
+        key = self.get_key(location, inventory, action)
+        if key not in self.value_table:
+            self.value_table[key] = torch.tensor(0.0, requires_grad=True, device=self.device)
+
+        value = self.value_table[key]
+        loss = (value - target_value.detach()) ** 2
+
+        loss.backward()
+
+        with torch.no_grad():
+            # 手动更新表中的值
+            self.value_table[key] -= lr * value.grad
+            self.value_table[key].grad = None  # 清除梯度，准备下一次
+        return loss.item()
 
 class RewardModelWithLoRA(nn.Module):
     def __init__(self, base_model_name_or_path, lora_path, device):
@@ -129,7 +161,7 @@ def load_models(args):
     
     if args.cm_use_rm:
         CM = CriticModel_RM(args.rm_path, device=args.cm_device)
-        CM.load_state_dict(torch.load(args.rm_ckpts, map_location=args.cm_device))
+        # CM.load_state_dict(torch.load(args.rm_ckpts, map_location=args.cm_device))
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
             inference_mode=False,
@@ -140,6 +172,8 @@ def load_models(args):
         CM.model = get_peft_model(CM.model, peft_config)
         CM.to(args.cm_device)
         # print(CM.model.print_trainable_parameters())
+    elif args.cm_use_table:
+        CM = TableValueCritic(device=args.cm_device)
     else:
         CM = CriticModel(AM, device=args.cm_device)
 
