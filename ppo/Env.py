@@ -2,7 +2,7 @@ from jericho import FrotzEnv
 
 class ZorkEnv:
     def __init__(self, env_name, max_history=3, max_repeat=20):
-        path = f"../z-machine-games-master/jericho-game-suite/{env_name}"
+        path = f"env/jericho-game-suite/{env_name}"
         self.env = FrotzEnv(path)
         self.max_history = max_history
         self.max_repeat = max_repeat

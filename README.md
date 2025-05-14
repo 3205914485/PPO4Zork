@@ -8,6 +8,7 @@ This repository contains code for training a language model agent to play the cl
 .
 ├── sft/          # Supervised Fine-Tuning (SFT) code
 ├── ppo/          # PPO training code
+├── mutil_agents/          # Mutil-Agents PPO training code
 ├── evaluate/     # Evaluation and analysis scripts
 ├── data/         # Dataset files (walkthroughs, SFT data, reward annotations)
 └── README.md

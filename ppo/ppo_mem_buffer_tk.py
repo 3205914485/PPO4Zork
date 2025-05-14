@@ -13,6 +13,8 @@ from tqdm import tqdm
 from collections import Counter
 import math
 import re
+from collections import deque
+import random
 
 from models import load_models
 from MemoryAgent import MemoryAgent
@@ -25,6 +27,27 @@ SYSTEM_ACTOR_PROMPT = (
     "At each step, you will be shown some candidate actions for reference.\n"
     "You can either choose one of them, or generate your own appropriate action to proceed.\n\n"
 )
+
+SYSTEM_CRITIC_PROMPT = (
+    "You are a value estimation model in a text-based interactive fiction game.\n"
+    "Your task is to evaluate the quality of a decision-making context, based on the current locations and past actions.\n"
+    "You will be given a history of previous locations and actions, along with the current state.\n"
+    "Your job is to assess how promising this context is in terms of achieving high rewards in the game.\n\n"
+)
+ 
+class TrajectoryReplayBuffer:
+    def __init__(self, max_size=10):
+        self.buffer = deque(maxlen=max_size)
+
+    def add(self, trajectory, score):
+        self.buffer.append((trajectory, score))
+
+    def sample_trajectories(self, num_trajectories):
+        return random.sample(self.buffer, min(num_trajectories, len(self.buffer)))
+
+    def __len__(self):
+        return len(self.buffer)
+
 
 def print_trainable_parameters(model, model_name="Model"):
     total_params = 0
@@ -89,6 +112,21 @@ def build_actor_prompt(history, current, memory):
     prompt += "What should you do next?\nFirst, think carefully and reason about the situation within a <think>...</think> block.\nThen, provide your final action within an <answer>...</answer> block."
     return prompt
 
+def build_critic_prompt(history, current):
+    # prompt = SYSTEM_CRITIC_PROMPT
+    prompt = ''
+    # if history:
+    #     prompt += "--- Previous Actions & Observations ---\n"
+    #     for line in history:
+    #         prompt += f"location:{line['location'].strip()} \n inventory:{line['inventory']} \n>action:{line['action'].strip()}\n\n"
+    #     prompt += "\n"
+
+    prompt += "--- Current Observation ---\n"
+    prompt += f"Location: {current['location']}\n"
+    prompt += f"Inventory: {current['inventory']}\n"
+    # prompt += f"Action: {current['action']}\n\n"
+    # prompt += "Score this action from 0 to 1:\nAnswer:"
+    return prompt
 def generate_action(tokenizer, actor, prompt, max_length=2048):
     with torch.no_grad():
         # 1. sample output
@@ -134,6 +172,14 @@ def generate_action(tokenizer, actor, prompt, max_length=2048):
         action_log_prob = selected_logprobs.sum(dim=-1).item()
 
         return generated_text, action, action_log_prob, success_flag
+def estimate_value(tokenizer, critic_model, prompt, max_length=1024):
+    with torch.no_grad():
+        inputs = tokenizer(prompt, padding="max_length", truncation=True,
+                        max_length=max_length, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(critic_model.device)
+        attention_mask = inputs["attention_mask"].to(critic_model.device)
+        value = critic_model(input_ids=input_ids, attention_mask=attention_mask)
+    return value.item()
 
 def ppo_loop(args):
 
@@ -151,9 +197,10 @@ def ppo_loop(args):
     actor, critic, reward_model = load_models(args)
 
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
     scores_list = [0]
     env = ZorkEnv("zork1.z5", max_repeat=30, max_history=args.max_history)
-
+    trajectory_buffer = TrajectoryReplayBuffer(max_size=args.traj_buffer_size)
     # Sample trajetories
     for episode in range(args.max_episodes):
         print("Sampling trajectory")
@@ -166,7 +213,7 @@ def ppo_loop(args):
         end = None
         while not env.terminal and step < args.max_epochs:
             memory = memory_agent.summarize()
-            print(f"Memory \n{memory}\n")
+            print(f"\nMemory \n{memory}\n")
             actor_prompt = build_actor_prompt(env.history, step_info, memory)
             generate, action, log_prob, thinking_flag = generate_action(tokenizer, actor, actor_prompt)
             step_info['action'] = action
@@ -175,11 +222,13 @@ def ppo_loop(args):
             thinking_flags.append(thinking_flag)
 
             if thinking_flag:
-                value = critic(location, [], 'N') #No inventory info
+                critic_prompt = build_critic_prompt(env.history, step_info)
+                value = estimate_value(tokenizer, critic, critic_prompt)
                 step_info = env.step(action)
                 reward = step_info['reward']
                 transitions["prompts"].append({
-                                "actor_prompt":actor_prompt
+                                "actor_prompt":actor_prompt,
+                                "critic_prompt":critic_prompt
                                 })
                 transitions["locations"].append(location)
                 transitions["inventories"].append(inventory)
@@ -202,17 +251,13 @@ def ppo_loop(args):
                 print("The agent has been stuck !!")
                 break
 
-
         step_bar.close()
         score = env.score
         total_reward = sum(transitions["rewards"])
         print(f"End: {end}")
         print(f"Score: {score}")
-        print("Sampling Done")
+        print("Sampling Done")          
 
-        ppo_epochs = args.ppo_epochs
-        if score > max(scores_list):
-            ppo_epochs *= 3
         scores_list.append(score)
 
         # GAE advantage & returns
@@ -238,6 +283,24 @@ def ppo_loop(args):
         transitions['values'] = list(values.numpy())
         transitions['advantages'] = list(advantages.numpy())
         transitions['returns'] = list(returns.numpy())
+        
+        if args.min_score_to_add == -1:
+            if len(trajectory_buffer) == 0:
+                threshold = 0  # 第一个 traj 默认加入
+            else:
+                scores = [s for (_, s) in trajectory_buffer.buffer]
+                threshold = sum(scores) / len(scores)
+
+            if score >= threshold:
+                print(f"Adding trajectory to buffer (Score: {score} >= Avg Buffer Score: {threshold:.2f})")
+                trajectory_buffer.add(transitions, score)
+            else:
+                print(f"Trajectory skipped (Score: {score} < Avg Buffer Score: {threshold:.2f})")
+
+        elif score >= args.min_score_to_add:
+            print(f"Adding trajectory to buffer (Score: {score} >= Min Score: {args.min_score_to_add})")
+            trajectory_buffer.add(transitions, score)
+
 
         save_trajectory(episode + 1, transitions, save_dir=args.trj_save_path)
         # PPO train
@@ -246,52 +309,66 @@ def ppo_loop(args):
         actor.train()
         critic.train()
         print_trainable_parameters(actor, "Actor")
-        # print_trainable_parameters(critic, "Critic")
+        print_trainable_parameters(critic, "Critic")
         if args.pretrain_critic and episode <= args.pretrain_critic_episodes:
             print('Still Pretraining the critic')
 
-        for _ in tqdm(range(ppo_epochs)):
+        sampled_trajectories = trajectory_buffer.sample_trajectories(num_trajectories=args.sample_traj_per_update)
+
+        for traj, score in tqdm(sampled_trajectories):
+            thinking_flags = traj["thinking"]
+            generates = traj["generates"]
+            advantages = torch.tensor(traj["advantages"])
+            returns = torch.tensor(traj["returns"])
             j = 0
-            for i in tqdm(range(len(transitions["thinking"]))):
-                thinking_flag = transitions["thinking"][i]
-                generate = transitions['generates'][i]
-                
+
+            for i in range(len(thinking_flags)):
+                thinking_flag = thinking_flags[i]
+                generate = generates[i]
+
                 if thinking_flag:
-                    # --- critic ---
-                    prompt = transitions["prompts"][j]
-                    location = transitions["locations"][j]
-                    inventory = transitions["inventories"][j]
-                    action = transitions["actions"][j]
-                    old_log_prob = transitions["logprobs"][j]
+                    prompt = traj["prompts"][j]
+                    location = traj["locations"][j]
+                    inventory = traj["inventories"][j]
+                    action = traj["actions"][j]
+                    old_log_prob = traj["logprobs"][j]
                     advantage = advantages[j]
                     target = returns[j]
-                    critic_loss = critic.update(location, [], 'N', target, lr=args.critic_lr) # No inventory info
-                    critic_losses.append(critic_loss)
-                    
-                    # ---  actor ---
-                    if not args.pretrain_critic or episode > args.pretrain_critic_episodes:
 
+                    # --- critic ---
+                    critic_inputs = tokenizer(prompt['critic_prompt'], return_tensors="pt").to(critic.device)
+                    value_pred = critic(**critic_inputs) ## forward -> scaler
+                    target = target.to(critic.device).to(value_pred.dtype)  
+                    critic_loss = F.mse_loss(value_pred.squeeze(), target)
+                    if torch.isnan(critic_loss) or torch.isinf(critic_loss):
+                        print("Found NaN in critic loss, skipping step")
+                        continue
+                    critic_optimizer.zero_grad()
+                    critic_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
+                    critic_optimizer.step()
+                    critic_losses.append(critic_loss.item())
+
+                    # --- actor ---
+                    if not args.pretrain_critic or episode > args.pretrain_critic_episodes:
                         inputs = tokenizer(prompt['actor_prompt'] + generate, return_tensors="pt", padding=True).to(actor.model.device)
                         input_ids = inputs.input_ids
                         attention_mask = inputs.attention_mask
 
-                        # new policy log_prob
                         output = actor(input_ids=input_ids, attention_mask=attention_mask)
-                        logits = output.logits[:, :-1, :].cpu()  # remove last token (predict next) [bs, seqlen, vocab]
-                        probs = torch.log_softmax(logits, dim=-1) 
+                        logits = output.logits[:, :-1, :].cpu()
+                        probs = torch.log_softmax(logits, dim=-1)
 
                         generate_ids = tokenizer(generate, return_tensors="pt").input_ids[:, 1:]
                         selected_logprobs = probs[:, -generate_ids.size(1):].gather(-1, generate_ids.unsqueeze(-1)).squeeze(-1)
                         log_prob = selected_logprobs.sum(dim=-1)
 
-                        # PPO clipped loss
                         ratio = torch.exp(log_prob - old_log_prob)
                         surr1 = ratio * advantage
                         surr2 = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * advantage
 
                         actor_loss = -torch.min(surr1, surr2).mean()
                         if torch.isnan(actor_loss) or torch.isinf(actor_loss):
-                            print("Found NaN in actor loss, skipping step")
                             continue
                         actor_optimizer.zero_grad()
                         actor_loss.backward()
@@ -302,25 +379,23 @@ def ppo_loop(args):
                     j += 1
 
                 else:
+                    # No-thinking actor update (supervised style)
                     if not args.pretrain_critic or episode > args.pretrain_critic_episodes:
-                        # ---  actor ---
+                        prompt = traj["prompts"][j]  # usually j==i here
                         inputs = tokenizer(prompt['actor_prompt'] + generate, return_tensors="pt").to(actor.model.device)
                         input_ids = inputs.input_ids
                         attention_mask = inputs.attention_mask
 
-                        # forward
                         output = actor(input_ids=input_ids, attention_mask=attention_mask)
                         logits = output.logits[:, :-1, :].cpu()
                         probs = torch.log_softmax(logits, dim=-1)
 
                         generate_ids = tokenizer(generate, return_tensors="pt").input_ids[:, 1:]
-
                         selected_logprobs = probs[:, -generate_ids.size(1):].gather(-1, generate_ids.unsqueeze(-1)).squeeze(-1)
                         log_prob = selected_logprobs.sum(dim=-1)
 
-                        actor_loss = log_prob.mean()  
+                        actor_loss = log_prob.mean()
                         if torch.isnan(actor_loss) or torch.isinf(actor_loss):
-                            print("Found NaN in actor loss, skipping step")
                             continue
                         actor_optimizer.zero_grad()
                         actor_loss.backward()
@@ -341,8 +416,8 @@ def ppo_loop(args):
         # 保存模型
         if (episode + 1) % args.save_every == 0:
             actor.model.save_pretrained(os.path.join(args.save_path, f"actor_ep{episode+1}"))
-            torch.save(critic.value_table, os.path.join(args.save_path, f"critic_ep{episode+1}.pt"))
-            
+            torch.save(critic.value_head, os.path.join(args.save_path, f"critic_ep{episode+1}.pt"))
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Model Config
@@ -353,8 +428,8 @@ if __name__ == "__main__":
     parser.add_argument("--rm_ckpts", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lr1e-5/checkpoint-epoch29.pt")
     parser.add_argument("--rm_lora_path", type=str, default="sft/sft_model/qwen-2.5-1.5B-instruct_zork_lora_rk10/lora_epoch50")
     parser.add_argument("--device", type=str, default='cuda:0')
-    parser.add_argument("--cm_use_rm", type=int, default=0)
-    parser.add_argument("--cm_use_table", type=int, default=1)
+    parser.add_argument("--cm_use_rm", type=int, default=1)
+    parser.add_argument("--cm_use_table", type=int, default=0)
     parser.add_argument("--am_device", type=str, default='cuda:0')
     parser.add_argument("--cm_device", type=str, default='cuda:0')
     parser.add_argument("--rm_device", type=str, default='cuda:0')
@@ -362,12 +437,13 @@ if __name__ == "__main__":
     # Training Config
     parser.add_argument("--max_episodes", type=int, default=1000)
     parser.add_argument("--max_epochs", type=int, default=500, help='for a trajectory')
-    parser.add_argument("--ppo_epochs", type=int, default=2)
     parser.add_argument("--max_history", type=int, default=3)
     parser.add_argument("--critic_lr", type=float, default=1e-5)
     parser.add_argument("--actor_lr", type=float, default=3e-6)
     parser.add_argument("--rm_use", type=int, default=1)
-
+    parser.add_argument('--traj_buffer_size', type=int, default=10)
+    parser.add_argument('--min_score_to_add', type=float, default=10)
+    parser.add_argument('--sample_traj_per_update', type=int, default=5)
     # PPO Config
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lmbda", type=float, default=0.95)

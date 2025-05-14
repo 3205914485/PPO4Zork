@@ -182,7 +182,7 @@ def ppo_loop(args):
         end = None
         while not env.terminal and step < args.max_epochs:
             memory = memory_agent.summarize()
-            print(f"Memory \n{memory}\n")
+            print(f"\nMemory \n{memory}\n")
             actor_prompt = build_actor_prompt(env.history, step_info, memory)
             generate, action, log_prob, thinking_flag = generate_action(tokenizer, actor, actor_prompt)
             step_info['action'] = action
